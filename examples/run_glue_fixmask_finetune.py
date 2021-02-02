@@ -58,7 +58,7 @@ from transformers import (
     XLNetConfig,
     XLNetForSequenceClassification,
     XLNetTokenizer,
-    AutoConfig, 
+    AutoConfig,
     AutoTokenizer,
     AutoModelForSequenceClassification,
     get_linear_schedule_with_warmup,
@@ -76,6 +76,7 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
 
 ALL_MODELS = [""]
 """
@@ -117,20 +118,6 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-
-def concrete_stretched(alpha, l=0., r = 1.):
-    u = torch.zeros_like(alpha).uniform_().clamp_(0.0001, 0.9999)
-    s = (torch.sigmoid(u.log() - (1-u).log() + alpha)).detach()
-    u = s*(r-l) + l
-    t = u.clamp(0, 1000)
-    z = t.clamp(-1000, 1)
-    dz_dt = (t < 1).float().to(alpha.device).detach()
-    dt_du = (u > 0).float().to(alpha.device).detach()
-    du_ds = r - l
-    ds_dalpha = (s*(1-s)).detach()
-    dz_dalpha = dz_dt*dt_du*du_ds*ds_dalpha
-    return z.detach(), dz_dalpha.detach()
-
 def get_valid_metric(result, task):
     if task == "cola":
         return result["mcc"]
@@ -156,12 +143,25 @@ def get_valid_metric(result, task):
         raise KeyError(task)
 
 
+def concrete_stretched(alpha, l=0., r = 1.):
+    u = torch.zeros_like(alpha).uniform_().clamp_(0.0001, 0.9999)
+    s = (torch.sigmoid(u.log() - (1-u).log() + alpha)).detach()
+    u = s*(r-l) + l
+    t = u.clamp(0, 1000)
+    z = t.clamp(-1000, 1)
+    dz_dt = (t < 1).float().to(alpha.device).detach()
+    dt_du = (u > 0).float().to(alpha.device).detach()
+    du_ds = r - l
+    ds_dalpha = (s*(1-s)).detach()
+    dz_dalpha = dz_dt*dt_du*du_ds*ds_dalpha
+    return z.detach(), dz_dalpha.detach()
+
+
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
-    
-    best_val_metric = -10000
+
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
@@ -179,14 +179,37 @@ def train(args, train_dataset, model, tokenizer):
     alpha_params = []
     print("args.local-rank=", args.local_rank)
     
-       
+    best_val_metric = -10000
+    # load mask
+    saved = torch.load(args.mask_checkpoint)
+    nonzero_mask = {}
+    model_keys = model.state_dict().keys()
+    n_and_p = list(model.named_parameters())
+    model_device = n_and_p[0][1].device
+    for n in saved["model"]:
+        extra = saved["model"][n].to(model_device) - saved["bert_params"][n][0].to(model_device)
+        if n in model_keys:
+            pass
+        elif n.replace("module.", "") in model_keys:
+            n = n.replace("module.", "")
+        elif "module." + n in model_keys:
+            n = "module." + n
+
+        nonzero_mask[n] = extra != 0
+        if getattr(nonzero_mask[n], "requires_grad"):
+            nonzero_mask[n].requires_grad = False
+            print("Nonzero mask requires grad set to False")
+        nonzero_mask[n] = nonzero_mask[n].to(model_device)
+
+
     for n,p in model.named_parameters():
         p0 = torch.zeros_like(p.data).copy_(p) #original BERT
         p1 = torch.zeros_like(p.data) #params to be fine-tuned
+        if args.finetune == 1:
+            p1.data.copy_(saved["bert_params"][n][1].data)
         p1.requires_grad = True
-
         p1.grad = torch.zeros_like(p.data)
-        alpha = torch.zeros_like(p.data) + args.alpha_init
+        alpha = torch.zeros_like(p.data) + 5
         alpha.requires_grad = True
         alpha.grad = torch.zeros_like(p.data)
         if args.local_rank != -1 or args.n_gpu > 1:
@@ -194,43 +217,28 @@ def train(args, train_dataset, model, tokenizer):
         else:
             name = n
         bert_params[name] = [p0, p1, alpha]
+
         finetune_params.append(bert_params[name][1])
         alpha_params.append(bert_params[name][2])
-    model_device = list(model.named_parameters())[0][1].device
-
-    if args.per_params_alpha == 1:
-        per_params_alpha = {}
-        for n, p in model.named_parameters(): 
-            alpha = torch.zeros((1)).to(model_device) + args.alpha_init
-            alpha.requires_grad=True
-            alpha.grad = torch.zeros_like(alpha)
-            if args.local_rank != -1 or args.n_gpu > 1:
-                name = "module." + n
-            else:
-                name = n
-            per_params_alpha[name] = alpha
-            alpha_params.append(alpha)
-    
-    assert args.per_params_alpha == 0 or args.per_layer_alpha == 0, "Only support per params alpha OR per layer alpha"
     optimizer_grouped_parameters = [
         {
-            "params": [p[1] for n, p in bert_params.items() if not any(nd in n for nd in no_decay) and p[1].requires_grad is True],
+            "params": [p[1] for n, p in bert_params.items() if not any(nd in n for nd in no_decay)],
             "weight_decay": args.weight_decay,
         },
-        {"params": [p[1] for n, p in bert_params.items() if any(nd in n for nd in no_decay) and p[1].requires_grad is True], "weight_decay": 0.0},
+        {"params": [p[1] for n, p in bert_params.items() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
     ]
 
 
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-    alpha_optimizer = AdamW(alpha_params, lr = 0.1, eps=args.adam_epsilon)
+    #alpha_optimizer = AdamW(alpha_params, lr = 0.1, eps=args.adam_epsilon)
 
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
     )
 
-    scheduler2 = get_linear_schedule_with_warmup(
-        alpha_optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
-    )
+    #scheduler2 = get_linear_schedule_with_warmup(
+    #    alpha_optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
+    #)
 
     # Check if saved optimizer or scheduler states exist
     if os.path.isfile(os.path.join(args.model_name_or_path, "optimizer.pt")) and os.path.isfile(
@@ -295,36 +303,6 @@ def train(args, train_dataset, model, tokenizer):
         epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0],
     )
     set_seed(args)  # Added here for reproductibility
-    #print("model=",model)
-    #print("modelkeys=", model.state_dict().keys())
-    total_layers = 14 if "base" in args.model_name_or_path else 26
-    if args.sparsity_penalty_per_layer is None:
-        sparsity_pen = [args.sparsity_pen] * total_layers  # NB(demi)
-    else:
-        sparsity_pen = args.sparsity_penalty_per_layer
-        assert len(sparsity_pen) == total_layers,  "invalid sparsity penalty per layer: # of layers mismatch"
-    
-    modelname = args.model_type
-    # get sparsity penalty
-    def get_layer_ind(n):
-        if modelname == "xlnet":
-            if "transformer.word_embedding" in n:
-                ind=0
-            elif "transformer.layer"  in n:
-                ind = int(n.replace("transformer.layer.", "").split(".")[0])+1
-            else:
-                ind = total_layers-1
-
-        else:
-            if "%s.embeddings"%modelname in n:
-                ind = 0
-            elif "%s.encoder.layer"%modelname in n:
-                ind = int(n.replace("%s.encoder.layer."%modelname, "").split(".")[0]) + 1
-            else:
-                ind = total_layers - 1
-        return ind
-
-
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         epoch_steps = len(epoch_iterator)
@@ -343,16 +321,7 @@ def train(args, train_dataset, model, tokenizer):
                 log_ratio = 0
             else:
                 log_ratio = np.log(-args.concrete_lower / args.concrete_upper)
-            
-            # l0_pen = 0
-            l0_pen = [0] * total_layers
-            l0_pen_sum = 0
-
-
-            if args.per_params_alpha:
-                per_params_z = {}
-                per_params_z_grad = {}
-            
+            l0_pen = 0
             for n, p in model.named_parameters():
                 if n not in bert_params:
                     print(" n not in bert_params")
@@ -362,35 +331,16 @@ def train(args, train_dataset, model, tokenizer):
                     nonzero_params += p.numel()
                     p.data.copy_(bert_params[n][0].data + bert_params[n][1].data)
                 else:
-
-                    if args.per_params_alpha == 1:
-                        params_z, params_z_grad = concrete_stretched(per_params_alpha[n], args.concrete_lower,
-                                args.concrete_upper)
-                        per_params_z[n] = params_z
-                        per_params_z_grad[n] = params_z_grad
-
-                    z, z_grad = concrete_stretched(bert_params[n][2], args.concrete_lower,
-                                                   args.concrete_upper)
+                    #z, z_grad = concrete_stretched(bert_params[n][2], args.concrete_lower,
+                    #                               args.concrete_upper)
                     # z, z_grad = concrete(bert_params[n][2], args.temp, discrete=False)
-                    
-                    ind = get_layer_ind(n)
-                    l0_pen[ind] += torch.sigmoid(bert_params[n][2] - log_ratio).sum()
-                    l0_pen_sum += torch.sigmoid(bert_params[n][2] - log_ratio).sum()
-                    
-                    if args.per_layer_alpha == 1:
-                        z2 = per_layer_z[ind]
-                    elif args.per_params_alpha == 1:
-                        z2 =  per_params_z[n]
-                    else:
-                        z2 = 1
-
-                    grad_params[n] = [bert_params[n][1] * z2, z * z2, z_grad, bert_params[n][1] * z]
-
-                    if args.per_params_alpha == 1:
-                        l0_pen[ind] += torch.sigmoid(per_params_alpha[n] - log_ratio).sum()
-                
-                    p.data.copy_(bert_params[n][0].data + (z2*z).data*bert_params[n][1].data)
-                    nonzero_params += ((z2*z)>0).float().detach().sum().item()
+                    z = nonzero_mask[n]
+                    if "full_mask" in args.mask_checkpoint:
+                        assert torch.sum(z).item() == z.numel()
+                    #l0_pen += torch.sigmoid(bert_params[n][2] - log_ratio).sum()
+                    grad_params[n] = [bert_params[n][1], z, torch.zeros_like(z)]
+                    p.data.copy_(bert_params[n][0].data + z.data*bert_params[n][1].data)
+                    nonzero_params += (z>0).float().detach().sum().item()
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
@@ -418,9 +368,6 @@ def train(args, train_dataset, model, tokenizer):
                 len(epoch_iterator) <= args.gradient_accumulation_steps
                 and (step + 1) == len(epoch_iterator)
             ):
-                
-                if args.per_layer_alpha == 1:
-                    per_layer_alpha.grad.zero_()
 
                 for n, p in model.named_parameters():
                     if p.grad is None:
@@ -428,67 +375,33 @@ def train(args, train_dataset, model, tokenizer):
                     if "classifier" in n:
                         bert_params[n][1].grad.copy_(p.grad.data)
                     else:
-                        try:
-                            bert_params[n][1].grad.copy_(p.grad.data * grad_params[n][1].data)
-                        except:
-                            embed()
-                        bert_params[n][2].grad.copy_(p.grad.data * grad_params[n][0].data *
-                                                     grad_params[n][2].data)
-                    
-                        if args.per_params_alpha == 1:
-                            per_params_alpha[n].grad.copy_(torch.sum(p.grad.data * grad_params[n][3].data * 
-                                    per_params_z_grad[n].data))
-                        if args.per_layer_alpha == 1:
-                            per_layer_alpha.grad[get_layer_ind(n)] += torch.sum(p.grad.data * grad_params[n][3].data *
-                                    per_layer_z_grad[ind].data)
-
-                sum_l0_pen = 0
-                for i in range(total_layers):
-                    if l0_pen[i] != 0:
-                        sum_l0_pen += (sparsity_pen[i] * l0_pen[i]).sum()
-                sum_l0_pen.sum().backward()
-
+                        bert_params[n][1].grad.copy_(p.grad.data * grad_params[n][1].data)
+                        #bert_params[n][2].grad.copy_(p.grad.data * grad_params[n][0].data *
+                        #                             grad_params[n][2].data)
+                # (args.sparsity_pen*(l0_pen)).sum().backward()
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 torch.nn.utils.clip_grad_norm_(finetune_params, args.max_grad_norm)
-                torch.nn.utils.clip_grad_norm_(alpha_params, args.max_grad_norm)
+                #torch.nn.utils.clip_grad_norm_(alpha_params, args.max_grad_norm)
                 optimizer.step()
-                alpha_optimizer.step()
+                #alpha_optimizer.step()
                 scheduler.step()  # Update learning rate schedule
                 model.zero_grad()
                 params_norm = [0, 0, 0, 0, 0, 0]
-                exp_z = 0
                 for n, p in bert_params.items():
-                    params_norm[0] += p[2].sum().item()
-                    params_norm[1] += p[2].norm().item()**2
-                    params_norm[2] += p[2].grad.norm().item()**2
-                    params_norm[3] += torch.sigmoid(p[2]).sum().item()
+                    #params_norm[0] += p[2].sum().item()
+                    #params_norm[1] += p[2].norm().item()**2
+                    #params_norm[2] += p[2].grad.norm().item()**2
+                    #params_norm[3] += torch.sigmoid(p[2]).sum().item()
                     params_norm[4] += p[2].numel()
                     # params_norm[5] += (grad_params[n][1] > 0).float().sum().item()
-                    if args.per_params_alpha == 1:
-                        exp_z += (torch.sigmoid(p[2]).sum() * torch.sigmoid(per_params_alpha[n])).item()
-                    else:
-                        exp_z += torch.sigmoid(p[2]).sum().item()
-
-                    p[1].grad.zero_()
-                    p[2].grad.zero_()
-
-                mean_exp_z = exp_z / params_norm[4]
-
-                    
-                if args.per_layer_alpha == 1:
-                    per_layer_alpha.grad.zero_()
-                if args.per_params_alpha == 1:
-                    for n,p in per_params_alpha.items():
-                        p.grad.zero_()
+                    #p[1].grad.zero_()
+                    #p[2].grad.zero_()
 
                 if (step + 1)% 100 == 0:
-                    print("outdated average prob: %.4f, new average prob: %.4f, (!)empirical prob: %.4f, alpha_norm: %.4f, alpha_grad_norm: %.8f, alpha_avg: %.4f, l0_pen: %.2f, \n" %
-                          (params_norm[3]/params_norm[4], mean_exp_z, nonzero_params/params_norm[4],
-                           params_norm[1]**0.5, params_norm[2]**0.5, params_norm[0]/params_norm[4],
-                           l0_pen_sum))
+                    print("empirical prob:", nonzero_params/params_norm[4])
                 global_step += 1
 
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
@@ -513,11 +426,9 @@ def train(args, train_dataset, model, tokenizer):
                         tb_writer.add_scalar(key, value, global_step)
                     print(json.dumps({**logs, **{"step": global_step}}))
 
-                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
-                    # Save model checkpoint
-                    os.system("rm -rf %s/checkpoint-*" % (args.output_dir))
-
-                    """
+                if args.local_rank in [-1, 0] and args.save_steps > 0 and (global_step % args.save_steps == 0 or \
+                        global_step % epoch_steps == 0):
+                    output_dir = args.output_dir
                     nonzero_params = [0, 0]
                     for n, p in model.named_parameters():
                         assert(n in bert_params)
@@ -527,46 +438,38 @@ def train(args, train_dataset, model, tokenizer):
                             nonzero_params[1] += p.numel()
                             p.data.copy_(bert_params[n][0].data + bert_params[n][1].data)
                         else:
-                            z, _ = concrete_stretched(bert_params[n][2], args.concrete_lower,
-                                                      args.concrete_upper)
+                            z = nonzero_mask[n]
+                            #z, _ = concrete_stretched(bert_params[n][2], args.concrete_lower,
+                            #                          args.concrete_upper)
                             # z, z_grad = concrete(bert_params[n][2], args.temp, discrete=True)
-                            if args.per_params_alpha == 1:
-                                params_z, params_z_grad = concrete_stretched(per_params_alpha[n], args.concrete_lower,
-                                        args.concrete_upper)
-                                z2 = params_z
-                            elif args.per_layer_alpha == 1:
-                                z2 = per_layer_z[get_layer_ind(n)]
-                            else:
-                                z2 = 1
 
-                            p.data.copy_(bert_params[n][0].data + z2.data * z.data*bert_params[n][1].data)
-                            nonzero_params[1] += ((z2*z) > 0).float().sum().item()
+                            p.data.copy_(bert_params[n][0].data + z.data*bert_params[n][1].data)
+                            nonzero_params[1] += (z > 0).float().sum().item()
                         nonzero_params[0] += p.numel()
-                        """
-                    #print("nonzero params:", nonzero_params, " ratio:", nonzero_params[1]/nonzero_params[0])
+                    print("nonzero params:", nonzero_params, " ratio:", nonzero_params[1]/nonzero_params[0])
                     model_to_save = (
                         model.module if hasattr(model, "module") else model
                     )  # Take care of distributed/parallel training
 
-                    info_dict = {"model": model.state_dict(), "bert_params": bert_params} #, "z": z.detach(), "nonzero_params": nonzero_params}
+                    info_dict = {"model": model.state_dict(), "bert_params": bert_params, "z": z.detach(), "nonzero_params": nonzero_params}
                     torch.save(info_dict, os.path.join(args.output_dir, "checkpoint-last-info.pt"))
                     logger.info("Saving all training information: bert params, z, nonzero_params at time step  %d to checkpoint-last-info.pt" % global_step)
-
-                    logs = {}
+ 
+                    # save best 
                     results = evaluate(args, model, tokenizer)
+                    logs = {}
                     for key, value in results.items():
                         eval_key = "eval_{}".format(key)
                         logs[eval_key] = value
                     print(json.dumps({**logs, **{"step": global_step}}))
-                    
                     val_metric = get_valid_metric(results, args.task_name)
+                    print("val_metric=", val_metric, " previous best=", best_val_metric)
                     if val_metric > best_val_metric:
                         best_val_metric = val_metric
                         torch.save(info_dict, os.path.join(args.output_dir, "checkpoint-best-info.pt"))
                         logger.info("Saving all training information: bert params, z, nonzero_params to checkpoint-best-info.pt")
 
-                    """
-                    if global_step % (args.save_steps * 5) == 0:
+                        # NB(demi): save best to current directory
                         model_to_save.save_pretrained(output_dir)
                         tokenizer.save_pretrained(output_dir)
 
@@ -576,7 +479,6 @@ def train(args, train_dataset, model, tokenizer):
                         torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
                         torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
                         logger.info("Saving optimizer and scheduler states to %s", output_dir)
-                    """
 
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
@@ -651,7 +553,6 @@ def evaluate(args, model, tokenizer, prefix=""):
         results.update(result)
         if args.task_name == "mnli":
             results.update({"%s_acc" % eval_task: result["acc"]})
-            result = results  # HACK
 
 
         output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
@@ -754,6 +655,20 @@ def main():
         help="The name of the task to train selected in the list: " + ", ".join(processors.keys()),
     )
     parser.add_argument(
+        "--mask_checkpoint",
+        default=None,
+        type=str,
+        required=True,
+        help="Nonzero mask checkpoint")
+
+    parser.add_argument(
+        "--finetune",
+        default=0,
+        type=int,
+        required=False,
+        help="Whether finetune from mask checkpoint or train from scratch.")
+
+    parser.add_argument(
         "--output_dir",
         default=None,
         type=str,
@@ -791,15 +706,6 @@ def main():
         type=float,
         help="Sparsity penalty.",
     )
-    
-    parser.add_argument(
-        "--sparsity_penalty_per_layer",
-        default=None,
-        type=float,
-        nargs="+",
-        help="Sparsity penalty per layer.",
-    )
-
 
     parser.add_argument(
         "--temp",
@@ -814,27 +720,13 @@ def main():
         type=float,
         help="Temperature.",
     )
-
     parser.add_argument(
         "--concrete_upper",
         default=1.5,
         type=float,
         help="Temperature.",
     )
-    parser.add_argument(
-        "--fix_layer",
-        default=-1,
-        type=int,
-        help="whether to fix layers"
-    )
-    parser.add_argument(
-        "--alpha_init",
-        default=5,
-        type=int,
-        help="Alpha init value",
-    )
-    
-    
+
     parser.add_argument("--do_train", action="store_true", help="Whether to run training.")
     parser.add_argument("--do_eval", action="store_true", help="Whether to run eval on the dev set.")
     parser.add_argument(
@@ -902,11 +794,7 @@ def main():
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--server_ip", type=str, default="", help="For distant debugging.")
     parser.add_argument("--server_port", type=str, default="", help="For distant debugging.")
-    parser.add_argument("--per_layer_alpha", type=int, default=0, help="Per layer alpha")
-    parser.add_argument("--per_params_alpha", type=int, default=1, help="Per params alpha")
     args = parser.parse_args()
-    print("parse args!!=", args)
-    print(args.sparsity_penalty_per_layer)
 
     if (
         os.path.exists(args.output_dir)
@@ -1005,23 +893,8 @@ def main():
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
+    # NB(demi): load best fine-tuned checkpoint
     if args.do_train and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
-        # Create output directory if needed
-        if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
-            os.makedirs(args.output_dir)
-
-        logger.info("Saving model checkpoint to %s", args.output_dir)
-        # Save a trained model, configuration and tokenizer using `save_pretrained()`.
-        # They can then be reloaded using `from_pretrained()`
-        model_to_save = (
-            model.module if hasattr(model, "module") else model
-        )  # Take care of distributed/parallel training
-        model_to_save.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
-
-        # Good practice: save your training arguments together with the trained model
-        torch.save(args, os.path.join(args.output_dir, "training_args.bin"))
-
         # Load a trained model and vocabulary that you have fine-tuned
         model = model_class.from_pretrained(args.output_dir)
         tokenizer = tokenizer_class.from_pretrained(args.output_dir)
@@ -1044,6 +917,7 @@ def main():
 
             model = model_class.from_pretrained(checkpoint)
             model.to(args.device)
+            print("evaluate model_class.from_pretrained checkpoint=", checkpoint, " prefix=", prefix)
             result = evaluate(args, model, tokenizer, prefix=prefix)
             result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
             results.update(result)
