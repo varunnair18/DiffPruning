@@ -179,31 +179,32 @@ def train(args, train_dataset, model, tokenizer):
     alpha_params = []
     print("args.local-rank=", args.local_rank)
     
+    model_device = list(model.named_parameters())[0][1].device
        
     for n,p in model.named_parameters():
-        p0 = torch.zeros_like(p.data).copy_(p) #original BERT
-        p1 = torch.zeros_like(p.data) #params to be fine-tuned
+        p0 = torch.zeros_like(p.data, device="cpu").copy_(p) #original BERT
+        p1 = torch.zeros_like(p.data, device="cpu") #params to be fine-tuned
         p1.requires_grad = True
 
-        p1.grad = torch.zeros_like(p.data)
-        alpha = torch.zeros_like(p.data) + args.alpha_init
+        p1.grad = torch.zeros_like(p.data, device="cpu")
+        alpha = torch.zeros_like(p.data, device=model_device) + args.alpha_init
         alpha.requires_grad = True
-        alpha.grad = torch.zeros_like(p.data)
+        alpha.grad = torch.zeros_like(p.data, device=model_device)
         if args.local_rank != -1 or args.n_gpu > 1:
             name = "module." + n
         else:
             name = n
+
         bert_params[name] = [p0, p1, alpha]
         finetune_params.append(bert_params[name][1])
         alpha_params.append(bert_params[name][2])
-    model_device = list(model.named_parameters())[0][1].device
 
     if args.per_params_alpha == 1:
         per_params_alpha = {}
         for n, p in model.named_parameters(): 
-            alpha = torch.zeros((1)).to(model_device) + args.alpha_init
+            alpha = torch.zeros((1), device=model_device) + args.alpha_init
             alpha.requires_grad=True
-            alpha.grad = torch.zeros_like(alpha)
+            alpha.grad = torch.zeros_like(alpha, device=model_device)
             if args.local_rank != -1 or args.n_gpu > 1:
                 name = "module." + n
             else:
@@ -384,6 +385,10 @@ def train(args, train_dataset, model, tokenizer):
                     else:
                         z2 = 1
 
+                    z = z.cpu()
+                    z2 = z2.cpu()
+                    z_grad = z_grad.cpu()
+
                     grad_params[n] = [bert_params[n][1] * z2, z * z2, z_grad, bert_params[n][1] * z]
 
                     if args.per_params_alpha == 1:
@@ -399,6 +404,7 @@ def train(args, train_dataset, model, tokenizer):
                     batch[2] if args.model_type in ["bert", "xlnet", "albert"] else None
                 )  # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
             outputs = model(**inputs)
+
             loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
 
             if args.n_gpu > 1:
@@ -429,23 +435,26 @@ def train(args, train_dataset, model, tokenizer):
                         bert_params[n][1].grad.copy_(p.grad.data)
                     else:
                         try:
-                            bert_params[n][1].grad.copy_(p.grad.data * grad_params[n][1].data)
+                            bert_params[n][1].grad.copy_(p.grad.data.cpu() * grad_params[n][1].data.cpu())
                         except:
                             embed()
-                        bert_params[n][2].grad.copy_(p.grad.data * grad_params[n][0].data *
-                                                     grad_params[n][2].data)
+                        bert_params[n][2].grad.copy_(p.grad.data.cpu() * grad_params[n][0].data.cpu() *
+                                                     grad_params[n][2].data.cpu())
                     
                         if args.per_params_alpha == 1:
-                            per_params_alpha[n].grad.copy_(torch.sum(p.grad.data * grad_params[n][3].data * 
-                                    per_params_z_grad[n].data))
+                            per_params_alpha[n].grad.copy_(torch.sum(p.grad.data.cpu() * grad_params[n][3].data.cpu() * 
+                                    per_params_z_grad[n].data.cpu()))
                         if args.per_layer_alpha == 1:
-                            per_layer_alpha.grad[get_layer_ind(n)] += torch.sum(p.grad.data * grad_params[n][3].data *
-                                    per_layer_z_grad[ind].data)
+                            _device = per_layer_alpha.device
+                            per_layer_alpha.grad[get_layer_ind(n)] += torch.sum(p.grad.data.to(_device) * grad_params[n][3].data.to(_device) *
+                                    per_layer_z_grad[ind].data.to(_device))
+
 
                 sum_l0_pen = 0
                 for i in range(total_layers):
                     if l0_pen[i] != 0:
                         sum_l0_pen += (sparsity_pen[i] * l0_pen[i]).sum()
+
                 sum_l0_pen.sum().backward()
 
                 if args.fp16:
@@ -454,6 +463,7 @@ def train(args, train_dataset, model, tokenizer):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 torch.nn.utils.clip_grad_norm_(finetune_params, args.max_grad_norm)
                 torch.nn.utils.clip_grad_norm_(alpha_params, args.max_grad_norm)
+
                 optimizer.step()
                 alpha_optimizer.step()
                 scheduler.step()  # Update learning rate schedule
