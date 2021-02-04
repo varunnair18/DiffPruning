@@ -1,4 +1,9 @@
 # Byte-compiled / optimized / DLL files
+glue_data/
+logs/
+squad/
+runs/
+**/*.pyc
 **/__pycache__/
 *.py[cod]
 *$py.class
