@@ -201,7 +201,6 @@ def train(args, train_dataset, model, tokenizer):
             print("Nonzero mask requires grad set to False")
         nonzero_mask[n] = nonzero_mask[n].to(model_device)
 
-
     for n,p in model.named_parameters():
         p0 = torch.zeros_like(p.data).copy_(p) #original BERT
         p1 = torch.zeros_like(p.data) #params to be fine-tuned
@@ -256,8 +255,8 @@ def train(args, train_dataset, model, tokenizer):
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
     # multi-gpu training (should be after apex fp16 initialization)
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+    # if args.n_gpu > 1:
+    #     model = torch.nn.DataParallel(model)
 
     # Distributed training (should be after apex fp16 initialization)
     if args.local_rank != -1:
@@ -511,8 +510,8 @@ def evaluate(args, model, tokenizer, prefix=""):
         eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
         # multi-gpu eval
-        if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
-            model = torch.nn.DataParallel(model)
+        # if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
+        #     model = torch.nn.DataParallel(model)
 
         # Eval!
         logger.info("***** Running evaluation {} *****".format(prefix))

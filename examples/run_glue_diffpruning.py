@@ -180,13 +180,15 @@ def train(args, train_dataset, model, tokenizer):
     print("args.local-rank=", args.local_rank)
     
     model_device = list(model.named_parameters())[0][1].device
+
+    support_device = "cuda:1"
        
     for n,p in model.named_parameters():
-        p0 = torch.zeros_like(p.data, device="cpu").copy_(p) #original BERT
-        p1 = torch.zeros_like(p.data, device="cpu") #params to be fine-tuned
+        p0 = torch.zeros_like(p.data, device=support_device).copy_(p) #original BERT
+        p1 = torch.zeros_like(p.data, device=model_device) #params to be fine-tuned
         p1.requires_grad = True
 
-        p1.grad = torch.zeros_like(p.data, device="cpu")
+        p1.grad = torch.zeros_like(p.data, device=model_device)
         alpha = torch.zeros_like(p.data, device=model_device) + args.alpha_init
         alpha.requires_grad = True
         alpha.grad = torch.zeros_like(p.data, device=model_device)
@@ -361,7 +363,7 @@ def train(args, train_dataset, model, tokenizer):
                 assert(n in bert_params)
                 if "classifier" in n:
                     nonzero_params += p.numel()
-                    p.data.copy_(bert_params[n][0].data + bert_params[n][1].data)
+                    p.data.copy_(bert_params[n][0].data.to(model_device) + bert_params[n][1].data.to(model_device))
                 else:
 
                     if args.per_params_alpha == 1:
@@ -385,16 +387,16 @@ def train(args, train_dataset, model, tokenizer):
                     else:
                         z2 = 1
 
-                    z = z.cpu()
-                    z2 = z2.cpu()
-                    z_grad = z_grad.cpu()
+                    # z = z.to(support_device)
+                    # z2 = z2.to(support_device)
+                    # z_grad = z_grad.to(support_device)
 
-                    grad_params[n] = [bert_params[n][1] * z2, z * z2, z_grad, bert_params[n][1] * z]
+                    grad_params[n] = [bert_params[n][1].to(support_device) * z2.to(support_device), z.to(model_device) * z2.to(model_device), z_grad.to(model_device), bert_params[n][1].to(model_device) * z.to(model_device)]
 
                     if args.per_params_alpha == 1:
                         l0_pen[ind] += torch.sigmoid(per_params_alpha[n] - log_ratio).sum()
                 
-                    p.data.copy_(bert_params[n][0].data + (z2*z).data*bert_params[n][1].data)
+                    p.data.copy_(bert_params[n][0].data.to(model_device) + (z2.to(model_device)*z.to(model_device)).data*bert_params[n][1].data.to(model_device))
                     nonzero_params += ((z2*z)>0).float().detach().sum().item()
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
@@ -435,15 +437,19 @@ def train(args, train_dataset, model, tokenizer):
                         bert_params[n][1].grad.copy_(p.grad.data)
                     else:
                         try:
-                            bert_params[n][1].grad.copy_(p.grad.data.cpu() * grad_params[n][1].data.cpu())
+                            _device = bert_params[n][1].device
+                            bert_params[n][1].grad.copy_(p.grad.data.to(_device) * grad_params[n][1].data.to(_device))
                         except:
                             embed()
-                        bert_params[n][2].grad.copy_(p.grad.data.cpu() * grad_params[n][0].data.cpu() *
-                                                     grad_params[n][2].data.cpu())
+
+                        _device = bert_params[n][2].device
+                        bert_params[n][2].grad.copy_(p.grad.data.to(_device) * grad_params[n][0].data.to(_device) *
+                                                     grad_params[n][2].data.to(_device))
                     
                         if args.per_params_alpha == 1:
-                            per_params_alpha[n].grad.copy_(torch.sum(p.grad.data.cpu() * grad_params[n][3].data.cpu() * 
-                                    per_params_z_grad[n].data.cpu()))
+                            _device = per_params_alpha[n].device
+                            per_params_alpha[n].grad.copy_(torch.sum(p.grad.data.to(_device) * grad_params[n][3].data.to(_device) * 
+                                    per_params_z_grad[n].data.to(_device)))
                         if args.per_layer_alpha == 1:
                             _device = per_layer_alpha.device
                             per_layer_alpha.grad[get_layer_ind(n)] += torch.sum(p.grad.data.to(_device) * grad_params[n][3].data.to(_device) *
@@ -943,6 +949,7 @@ def main():
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         args.n_gpu = 0 if args.no_cuda else torch.cuda.device_count()
+        args.n_gpu = 1
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
