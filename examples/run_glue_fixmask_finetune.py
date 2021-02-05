@@ -563,17 +563,100 @@ def evaluate(args, model, tokenizer, prefix=""):
     return results
 
 
-def load_and_cache_examples(args, task, tokenizer, evaluate=False):
+def test(args, model, tokenizer, prefix=""):
+    # Loop to handle MNLI double evaluation (matched, mis-matched)
+    eval_task_names = ("mnli", "mnli-mm", "ax") if args.task_name == "mnli" else (args.task_name,)
+    
+    name_mapping = {
+        "sst-2": "SST-2",
+        "cola": "CoLA",
+        "mrpc": "MRPC",
+        "qnli": "QNLI",
+        "qqp": "QQP",
+        "rte": "RTE",
+        "sts-b": "STS-B",
+        "wnli": "WNLI",
+    }
+
+    output_names = ("MNLI-m", "MNLI-mm") if args.task_name == "mnli" else (name_mapping[args.task_name],)
+    
+    results = {}
+    for eval_task, output_name in zip(eval_task_names, output_names):
+        eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, test=True)
+
+        args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+        # Note that DistributedSampler samples randomly
+        eval_sampler = SequentialSampler(eval_dataset)
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+
+        # multi-gpu eval
+        # if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
+        #     model = torch.nn.DataParallel(model)
+
+        # Eval!
+        logger.info("***** Running evaluation {} *****".format(prefix))
+        logger.info("  Num examples = %d", len(eval_dataset))
+        logger.info("  Batch size = %d", args.eval_batch_size)
+        eval_loss = 0.0
+        nb_eval_steps = 0
+        preds = None
+        out_label_ids = None
+        for batch in tqdm(eval_dataloader, desc="Evaluating"):
+            model.eval()
+            batch = tuple(t.to(args.device) for t in batch)
+
+            with torch.no_grad():
+                inputs = {"input_ids": batch[0], "attention_mask": batch[1]}
+                if args.model_type != "distilbert":
+                    inputs["token_type_ids"] = (
+                        batch[2] if args.model_type in ["bert", "xlnet", "albert"] else None
+                    )  # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
+                outputs = model(**inputs)
+                logits = outputs[0]
+
+            nb_eval_steps += 1
+            if preds is None:
+                preds = logits.detach().cpu().numpy()
+            else:
+                preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
+
+        if args.output_mode == "classification":
+            preds = np.argmax(preds, axis=1)
+        elif args.output_mode == "regression":
+            preds = np.squeeze(preds)
+
+        out = "index\tprediction\n"
+
+        indices = list(range(len(preds)))
+
+        for i, p in zip(indices, preds):
+            out += f"{i}\t{p}\n"
+
+        file_name = f"{output_name}.tsv"
+        # file_name = os.path.join(args.output_dir, file_name)
+
+        with open(file_name, "w") as record_file:
+            record_file.write(out)
+
+
+def load_and_cache_examples(args, task, tokenizer, evaluate=False, test=False):
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
     processor = processors[task]()
     output_mode = output_modes[task]
+
     # Load data features from cache or dataset file
+    
+    if test:
+        set_type = "test"
+    else:
+        set_type = "dev" if evaluate else "train"
+
     cached_features_file = os.path.join(
         args.data_dir,
         "cached_{}_{}_{}_{}".format(
-            "dev" if evaluate else "train",
+            set_type,
             list(filter(None, args.model_name_or_path.split("/"))).pop(),
             str(args.max_seq_length),
             str(task),
@@ -588,9 +671,13 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
         if task in ["mnli", "mnli-mm"] and args.model_type in ["roberta", "xlmroberta"]:
             # HACK(label indices are swapped in RoBERTa pretrained model)
             label_list[1], label_list[2] = label_list[2], label_list[1]
-        examples = (
-            processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
-        )
+
+        if test:
+            examples = processor.get_test_examples(args.data_dir)
+        else:
+            examples = (
+                processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
+            )
         features = convert_examples_to_features(
             examples,
             tokenizer,
@@ -607,15 +694,15 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
 
     if args.local_rank == 0 and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
-
     # Convert to Tensors and build dataset
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
     all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
     all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
+
     if output_mode == "classification":
-        all_labels = torch.tensor([f.label for f in features], dtype=torch.long)
+        all_labels = torch.tensor([f.label if f.label is not None else -1 for f in features], dtype=torch.long)
     elif output_mode == "regression":
-        all_labels = torch.tensor([f.label for f in features], dtype=torch.float)
+        all_labels = torch.tensor([f.label if f.label is not None else -1 for f in features], dtype=torch.float)
 
     dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels)
     return dataset
@@ -728,6 +815,7 @@ def main():
 
     parser.add_argument("--do_train", action="store_true", help="Whether to run training.")
     parser.add_argument("--do_eval", action="store_true", help="Whether to run eval on the dev set.")
+    parser.add_argument("--do_test", action="store_true", help="Whether to run eval on the dev set.")
     parser.add_argument(
         "--evaluate_during_training", action="store_true", help="Run evaluation during training at each logging step.",
     )
@@ -820,6 +908,7 @@ def main():
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         args.n_gpu = 0 if args.no_cuda else torch.cuda.device_count()
+        args.n_gpu = 1
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
@@ -920,6 +1009,27 @@ def main():
             result = evaluate(args, model, tokenizer, prefix=prefix)
             result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
             results.update(result)
+
+
+    # Test
+    results = {}
+    if args.do_test and args.local_rank in [-1, 0]:
+        tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
+        checkpoints = [args.output_dir]
+        if args.eval_all_checkpoints:
+            checkpoints = list(
+                os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + "/**/" + WEIGHTS_NAME, recursive=True))
+            )
+            logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
+        logger.info("Evaluate the following checkpoints: %s", checkpoints)
+        for checkpoint in checkpoints:
+            global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
+            prefix = checkpoint.split("/")[-1] if checkpoint.find("checkpoint") != -1 else ""
+
+            model = model_class.from_pretrained(checkpoint)
+            model.to(args.device)
+            print("evaluate model_class.from_pretrained checkpoint=", checkpoint, " prefix=", prefix)
+            test(args, model, tokenizer, prefix=prefix)
 
     return results
 
