@@ -385,19 +385,19 @@ def train(args, train_dataset, model, tokenizer):
                     elif args.per_params_alpha == 1:
                         z2 =  per_params_z[n]
                     else:
-                        z2 = 1
+                        z2 = torch.tensor([1])
 
                     # z = z.to(support_device)
                     # z2 = z2.to(support_device)
                     # z_grad = z_grad.to(support_device)
-
+                    print(type(bert_params[n][1].to(support_device)), type(z2), type(z), type(z_grad))
                     grad_params[n] = [bert_params[n][1].to(support_device) * z2.to(support_device), z.to(model_device) * z2.to(model_device), z_grad.to(model_device), bert_params[n][1].to(model_device) * z.to(model_device)]
 
                     if args.per_params_alpha == 1:
                         l0_pen[ind] += torch.sigmoid(per_params_alpha[n] - log_ratio).sum()
                 
                     p.data.copy_(bert_params[n][0].data.to(model_device) + (z2.to(model_device)*z.to(model_device)).data*bert_params[n][1].data.to(model_device))
-                    nonzero_params += ((z2*z)>0).float().detach().sum().item()
+                    nonzero_params += ((z2.to(model_device)*z.to(model_device))>0).float().detach().sum().item()
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}

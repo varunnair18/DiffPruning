@@ -35,6 +35,7 @@ TASK2PATH = {"CoLA":'https://dl.fbaipublicfiles.com/glue/data/CoLA.zip',
              "QNLI":'https://dl.fbaipublicfiles.com/glue/data/QNLIv2.zip',
              "RTE":'https://dl.fbaipublicfiles.com/glue/data/RTE.zip',
              "WNLI":'https://dl.fbaipublicfiles.com/glue/data/WNLI.zip',
+             'MRPC':'https://raw.githubusercontent.com/MegEngine/Models/master/official/nlp/bert/glue_data/MRPC/dev_ids.tsv',
              "diagnostic":'https://dl.fbaipublicfiles.com/glue/data/AX.tsv'}
 
 MRPC_TRAIN = 'https://dl.fbaipublicfiles.com/senteval/senteval_data/msr_paraphrase_train.txt'

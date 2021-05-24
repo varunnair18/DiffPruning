@@ -632,7 +632,7 @@ def test(args, model, tokenizer, prefix=""):
         for i, p in zip(indices, preds):
             out += f"{i}\t{p}\n"
 
-        file_name = f"{output_name}.tsv"
+        file_name = f"{output_name}_{args.structured}.tsv"
         # file_name = os.path.join(args.output_dir, file_name)
 
         with open(file_name, "w") as record_file:
@@ -813,6 +813,7 @@ def main():
         help="Temperature.",
     )
 
+    parser.add_argument("--structured", default=1, type=int, help="1 if structured training, 0 if not.")
     parser.add_argument("--do_train", action="store_true", help="Whether to run training.")
     parser.add_argument("--do_eval", action="store_true", help="Whether to run eval on the dev set.")
     parser.add_argument("--do_test", action="store_true", help="Whether to run eval on the dev set.")
